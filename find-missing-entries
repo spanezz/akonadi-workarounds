@@ -1,0 +1,139 @@
+#!/usr/bin/python
+# coding: utf-8
+from __future__ import absolute_import
+from __future__ import print_function
+from __future__ import division
+from __future__ import unicode_literals
+# Last release: feb 2009 http://vobject.skyhouseconsulting.com/history.html
+# No python3 version available: https://bugs.debian.org/747554
+# Usage documentation: http://vobject.skyhouseconsulting.com/usage.html
+# API docs: http://vobject.skyhouseconsulting.com/epydoc/
+import vobject
+import shutil
+import argparse
+import os
+import io
+import uuid
+
+class Calendar(object):
+    def __init__(self, fname):
+        self.fname = fname
+        self.vevent_by_uid = {}
+        self.vevent_by_radicale = {}
+        self.parse(fname)
+
+    def parse(self, fname):
+        with io.open(fname, "rt") as fd:
+            for c in vobject.readComponents(fd):
+                self.process_component(c)
+
+    def process_component(self, comp):
+        meth = getattr(self, "process_{}".format(comp.name), None)
+        if meth is None:
+            raise NotImplementedError("processing {} is not implemented".format(comp.name))
+        return meth(comp)
+
+    def process_VCALENDAR(self, comp):
+        for ev in comp.contents["vevent"]:
+            self.process_component(ev)
+
+    def process_VEVENT(self, comp):
+        uid = comp.contents.get("uid", None)
+        if uid is None:
+            print("no uid found in", comp.contents["dtstart"], comp.contents["summary"])
+        else:
+            uid = uid[0].value
+            #print(self.fname, uid, comp.contents["dtstart"], comp.contents["summary"])
+            self.vevent_by_uid[uid] = comp
+
+def get_val(comp, name):
+    """
+    Get the value 'name' from a component, returning None if it is missing.
+
+    If multiple values exist, only the first is returned.
+    """
+    res = comp.contents.get(name, None)
+    if res is None: return None
+    return res[0].value
+
+def vevents_differ(vev1, vev2):
+    """
+    We cannot use Last-Modified to check if items are out of sync, because in
+    Akonadi's export it seems that Last-Modified is always a very recent date.
+    So we fall back on comparing on those items that we care about.
+    """
+    for key in "summary", "dtstart", "dtend", "description":
+        if get_val(vev1, key) != get_val(vev2, key):
+            return True
+
+    return False
+
+def get_filename(vev):
+    """
+    Compute a file name for a VEVENT component
+    """
+    res = get_val(vev, "x-radicale-name")
+    if res is not None: return res
+    res = get_val(vev, "uid")
+    if res is not None: return res + ".ics"
+    return unicode(uuid.uuid4())
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Contain damage created by akonadi failing to send calendar entries to vcal servers.')
+    parser.add_argument('akonadi_ical', help='ical file to examine, produced with a korganizer export of a full akonadi calendar')
+    parser.add_argument('server_ical', help='ical file to examine, downloaded from the server')
+    parser.add_argument('missing_ical_dir', help='output file with the event entries that need to be sent to the server')
+    args = parser.parse_args()
+
+    akonadi = Calendar(args.akonadi_ical);
+    server = Calendar(args.server_ical)
+
+    to_create = []
+    to_update = []
+
+    # open korganizer, disable all calendars except the one you want to check,
+    # File/Export/Export as vCalendar, save
+    #
+    # This *could* be automated by fetching items directly from akonadi, but
+    # the only information I found for getting data out of akonadi from python
+    # is https://forum.kde.org/viewtopic.php?f=43&t=94567 which is an
+    # unanswered request for help fixing an example script which doesn't work.
+    for uid, comp in akonadi.vevent_by_uid.items():
+        if uid not in server.vevent_by_uid:
+            print("only in akonadi:", uid, comp.contents["dtstart"][0].value, comp.contents["summary"][0].value)
+            to_create.append(comp)
+        else:
+            server_comp = server.vevent_by_uid[uid]
+            if vevents_differ(comp, server_comp):
+                #print(comp.contents.keys())
+                #comp.contents["last-modified"] != .contents["last-modified"]:
+                print("modified but unsynced:", uid, comp.contents["dtstart"][0].value, comp.contents["summary"][0].value)
+                to_update.append(comp)
+
+    # obtain .ics file from the server (with radicale, it was just a matter of
+    # copying the file from /var/lib/radicale/collections/ on the server.
+    #
+    # This could be automated even more by logging into the server and fetching
+    # the .ics file via CalDAV, but I cannot be bothered because exporting from
+    # akonadi is by far the biggest trouble.
+    for uid, comp in server.vevent_by_uid.items():
+        if uid not in akonadi.vevent_by_uid:
+            print("only in server:", uid, comp.contents["dtstart"][0].value, comp.contents["summary"][0].value)
+
+
+    # Write out the rest. We need one file per entry, because Radicale will use
+    # the file name as identifier for the entry.
+    if os.path.isdir(args.missing_ical_dir):
+        shutil.rmtree(args.missing_ical_dir)
+    os.makedirs(args.missing_ical_dir)
+
+    for vev in to_create + to_update:
+        fname = os.path.join(args.missing_ical_dir, get_filename(vev))
+        out = vobject.iCalendar()
+        out.add(vev)
+        with io.open(fname, "wb") as fd:
+            print(out.serialize(), file=fd)
+
+if __name__ == "__main__":
+    main()
